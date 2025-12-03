@@ -64,12 +64,27 @@ KITCHEN_ACTIVE_STATUSES = ["En preparación", "Listo para retiro"]
 
 def asignar_repartidor_automatico(db: Session, order: OrderORM) -> DeliveryPersonORM:
     """
-    Asigna automáticamente un repartidor usando la tabla TRACKING.
-    - Si el pedido ya tiene repartidor, lo reutiliza.
-    - Si no, busca el repartidor con menor carga de pedidos activos.
+    Asigna SIEMPRE al repartidor Vicente (ID fijo).
+    Ignora carga, orden, etc. -> Asignación fija.
     """
 
-    # 1) Buscar el tracking más reciente para este pedido
+    # ID de Vicente Repartidor
+    DRIVER_ID = "9a6aaf5d-cff5-11f0-924e-88f4daaf341b"
+
+    # 1) Buscar repartidor Vicente
+    repartidor = (
+        db.query(DeliveryPersonORM)
+        .filter(DeliveryPersonORM.id == DRIVER_ID)
+        .first()
+    )
+
+    if not repartidor:
+        raise HTTPException(
+            status_code=404,
+            detail="Repartidor fijo no encontrado en la base de datos."
+        )
+
+    # 2) Buscar tracking existente
     tracking = (
         db.query(TrackingORM)
         .filter(TrackingORM.order_id == order.id)
@@ -77,68 +92,26 @@ def asignar_repartidor_automatico(db: Session, order: OrderORM) -> DeliveryPerso
         .first()
     )
 
-    # Si ya tiene repartidor asignado, devolverlo
-    if tracking and tracking.driver_id:
-        driver = (
-            db.query(DeliveryPersonORM)
-            .filter(DeliveryPersonORM.id == tracking.driver_id)
-            .first()
-        )
-        if driver:
-            return driver
-
-    # 2) Obtener todos los repartidores registrados
-    repartidores = db.query(DeliveryPersonORM).all()
-
-    if not repartidores:
-        raise HTTPException(
-            status_code=400,
-            detail="No hay repartidores registrados para asignar."
-        )
-
-    # 3) Calcular la 'carga' de cada repartidor (cantidad de trackings activos)
-    mejor_repartidor = None
-    menor_carga = None
-
-    for r in repartidores:
-        carga = (
-            db.query(TrackingORM)
-            .filter(
-                TrackingORM.driver_id == r.id,
-                TrackingORM.status.in_(ESTADOS_ACTIVOS),
-            )
-            .count()
-        )
-
-        if (menor_carga is None) or (carga < menor_carga):
-            menor_carga = carga
-            mejor_repartidor = r
-
-    if mejor_repartidor is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No se pudo determinar un repartidor para asignar."
-        )
-
-    # 4) Crear o actualizar el tracking para este pedido
+    # 3) Crear tracking si no existe
     if tracking is None:
         tracking = TrackingORM(
             order_id=order.id,
             status="Repartidor asignado",
-            driver_id=mejor_repartidor.id,
+            driver_id=repartidor.id,
             updated_at=datetime.now(),
         )
         db.add(tracking)
     else:
-        tracking.driver_id = mejor_repartidor.id
-        if tracking.status in ["En preparación", "Listo para retiro"]:
-            tracking.status = "Repartidor asignado"
+        # Actualizar tracking existente
+        tracking.driver_id = repartidor.id
+        tracking.status = "Repartidor asignado"
         tracking.updated_at = datetime.now()
 
     db.commit()
     db.refresh(tracking)
 
-    return mejor_repartidor
+    return repartidor
+
 
 
 
@@ -327,6 +300,20 @@ class SearchFilterInput(BaseModel):
 
 
 # --- Diagrama 09: Registro de Pedidos ---
+class OrderItemDetail(BaseModel):
+    productName: str
+    quantity: int
+    price: float
+    subtotal: float
+
+
+class OrderDetail(BaseModel):
+    id: UUID
+    status: str
+    createdAt: datetime
+    total: float
+    items: List[OrderItemDetail]
+
 class OrderItemInput(BaseModel):
     productId: UUID
     quantity: int
@@ -1475,45 +1462,46 @@ def register_order(
     )
 
 
-@app.get(f"{API_PREFIX}/pedidos/{{order_id}}", response_model=Order, tags=["PedidoService"])
+@app.get(f"{API_PREFIX}/pedidos/{{order_id}}", response_model=OrderDetail, tags=["PedidoService"])
 def get_order_by_id(
     order_id: UUID,
     current_customer: Customer = Depends(get_current_customer),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
     (Diagrama 10) Obtener detalle de un pedido por ID.
     Solo permite ver pedidos del cliente autenticado.
     """
-    # Buscar el pedido en BD verificando que sea del usuario logueado
+
+    # 1) Buscar el pedido en BD verificando que sea del usuario logueado
     order_db = get_order_for_customer(db, str(order_id), str(current_customer.id))
     if not order_db:
         raise HTTPException(status_code=404, detail="Pedido no encontrado")
 
-    # Reconstruir la lista de items según tu modelo Pydantic
-    items_pydantic: List[OrderItemInput] = []
+    # 2) Construir la lista de ítems usando lo que realmente hay en order_item
+    response_items: List[OrderItemDetail] = []
     for item in order_db.items:
-        # product_name guarda el UUID en texto
-        product_uuid = UUID(item.product_name)
-        items_pydantic.append(
-            OrderItemInput(
-                productId=product_uuid,
-                quantity=item.quantity
+        response_items.append(
+            OrderItemDetail(
+                productName=item.product_name,                # 👈 aquí usamos el nombre tal cual
+                quantity=item.quantity,
+                price=float(item.price),
+                subtotal=float(item.price) * item.quantity,
             )
         )
 
-    # Estado desde tracking (o "pendiente" si no hay)
+    # 3) Estado desde tracking (o "pendiente" si no hay registro)
     status = order_db.tracking.status if order_db.tracking else "pendiente"
 
-    # Devolver en el formato de tu modelo Order
-    return Order(
+    # 4) Devolver el detalle del pedido
+    return OrderDetail(
         id=UUID(order_db.id),
-        userId=UUID(order_db.user_id),
-        items=items_pydantic,
-        notes=None,  # por ahora no guardamos notes en BD
         status=status,
-        createdAt=order_db.created_at
+        createdAt=order_db.created_at,
+        total=float(order_db.total),
+        items=response_items,
     )
+
 @app.get(
     f"{API_PREFIX}/pedidos/mis",
     response_model=List[MyOrderSummary],
@@ -1897,23 +1885,48 @@ def update_kitchen_status(
 
     nuevo_estado = input.status
 
+    # 1) Validar estado
     if nuevo_estado not in COCINA_ESTADOS_VALIDOS:
         raise HTTPException(
             status_code=400,
             detail=f"Estado inválido: {nuevo_estado}. Estados permitidos: {COCINA_ESTADOS_VALIDOS}"
         )
 
+    # 2) Buscar el pedido
     order_db = db.query(OrderORM).filter(OrderORM.id == order_id).first()
 
     if not order_db:
         raise HTTPException(status_code=404, detail="Pedido no encontrado")
 
-    # Actualizar estado
+    # 3) Actualizar estado del pedido
     order_db.status = nuevo_estado
+
+    # 4) Actualizar / crear registro en tracking
+    tracking_db = (
+        db.query(TrackingORM)
+        .filter(TrackingORM.order_id == order_id)
+        .first()
+    )
+
+    if not tracking_db:
+        # Si no existe tracking, lo creamos
+        tracking_db = TrackingORM(
+            id=str(uuid4()),
+            order_id=order_id,
+            status=nuevo_estado,
+            updated_at=datetime.utcnow(),
+            driver_id=None,  # en cocina aún no hay repartidor asignado
+        )
+        db.add(tracking_db)
+    else:
+        # Si ya existe, solo actualizamos estado y fecha
+        tracking_db.status = nuevo_estado
+        tracking_db.updated_at = datetime.utcnow()
+
     db.commit()
     db.refresh(order_db)
 
-    # Construir respuesta tipo KitchenOrder
+    # 5) Construir respuesta tipo KitchenOrder
     items = [
         KitchenOrderItem(
             productName=item.product_name,
@@ -2100,9 +2113,11 @@ def get_tracking(
 
 # --- Panel Repartidor: listar pedidos asignados ---
 
-@app.get(f"{API_PREFIX}/repartidores/{{driver_id}}/pedidos",
-         response_model=List[DriverOrder],
-         tags=["DeliveryPanel"])
+@app.get(
+    f"{API_PREFIX}/repartidores/{{driver_id}}/pedidos",
+    response_model=List[DriverOrder],
+    tags=["DeliveryPanel"]
+)
 def get_driver_orders(
     driver_id: str,
     db: Session = Depends(get_db)
@@ -2110,8 +2125,10 @@ def get_driver_orders(
     """
     Devuelve los pedidos asignados a un repartidor dado (driver_id),
     con su estado actual y el detalle de ítems.
+    Solo devuelve el ÚLTIMO tracking por pedido.
     """
-    # 1) Buscar todos los trackings de ese repartidor
+
+    # 1) Obtenemos todos los trackings de ese repartidor, ordenados del más nuevo al más viejo
     trackings = (
         db.query(TrackingORM)
         .filter(TrackingORM.driver_id == driver_id)
@@ -2119,14 +2136,19 @@ def get_driver_orders(
         .all()
     )
 
+    # 2) Nos quedamos solo con el último tracking de cada order_id
+    ultimos_por_pedido = {}
+    for tr in trackings:
+        if tr.order_id not in ultimos_por_pedido:
+            ultimos_por_pedido[tr.order_id] = tr
+
     resultado: List[DriverOrder] = []
 
-    for tr in trackings:
+    for tr in ultimos_por_pedido.values():
         order = db.query(OrderORM).filter(OrderORM.id == tr.order_id).first()
         if not order:
             continue
 
-        # Cliente (puede ser None)
         customer = db.query(CustomerORM).filter(
             CustomerORM.id == order.user_id
         ).first()
@@ -2151,13 +2173,14 @@ def get_driver_orders(
                 orderId=str(order.id),
                 customerName=customer.name if customer else None,
                 total=float(order.total or 0),
-                status=tr.status,
+                status=tr.status,          # 👈 estado actual del tracking
                 createdAt=order.created_at,
                 items=items_pydantic,
             )
         )
 
     return resultado
+
 class DriverUpdateStatusInput(BaseModel):
     status: str   # "En preparación", "En camino", "Entregado", etc.
 
